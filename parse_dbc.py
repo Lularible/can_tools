@@ -2,60 +2,63 @@
 from my_cantools.src import cantools
 import tkinter as tk  
 from tkinter import filedialog, messagebox  
+import threading
 
-class CANViewerApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title('CAN DBC Viewer')
-        self.geometry('1000x600')
+class CANViewerApp(tk.Tk):  
+    def __init__(self):  
+        super().__init__()  
+        self.title('CAN DBC Viewer')  
+        self.geometry('1000x600')  
 
-        # Load DBC file
-        self.load_dbc_file()
+        # Create frames and widgets first  
+        self.create_widgets()  
 
-        # Create frames
-        self.create_widgets()
+    def load_dbc_file_thread(self):  
+        """load DBC file in new thread"""  
+        file_path = filedialog.askopenfilename(  
+            title="Choose a dbc file",  
+            filetypes=[("DBC files", "*.dbc")]  
+        )  
+
+        if file_path:  
+            self.db = cantools.database.load_file(file_path)  
+            self.after(0, self.update_signal_list)  # 更新信号列表  
 
     def load_dbc_file(self):
-        root = tk.Tk()
-        root.withdraw()
+        threading.Thread(target=self.load_dbc_file_thread, daemon=True).start()  
 
-        file_path = filedialog.askopenfilename(
-            title="Choose a dbc file",
-            filetypes=[("DBC files", "*.dbc")]
-        )
+    def create_widgets(self):  
+        # Frame for Search  
+        self.search_frame = tk.Frame(self)  
+        self.search_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)  
 
-        if file_path:
-            self.db = cantools.database.load_file(file_path)
+        # Search for Signals  
+        self.signal_search_label = tk.Label(self.search_frame, text="Search Signals:")  
+        self.signal_search_label.pack(side=tk.LEFT, padx=5)  
+        self.signal_search_entry = tk.Entry(self.search_frame)  
+        self.signal_search_entry.pack(side=tk.LEFT, fill=tk.X, padx=5, expand=True)  
+        self.signal_search_entry.bind('<KeyRelease>', self.update_signal_list)  
 
-    def create_widgets(self):
-        # Frame for Search
-        self.search_frame = tk.Frame(self)
-        self.search_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+        # Frame for Signal List  
+        self.signal_frame = tk.Frame(self)  
+        self.signal_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)  
+        
+        self.signal_listbox = tk.Listbox(self.signal_frame)  
+        self.signal_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)  
+        self.signal_listbox.bind('<Double-1>', self.show_signal_details)  
 
-        # Search for Signals
+        # Start loading DBC file (the user will choose it once the app is up)  
+        self.load_dbc_file()  
 
-        self.signal_search_label = tk.Label(self.search_frame, text="Search Signals:")
-        self.signal_search_label.pack(side=tk.LEFT, padx=5)
-        self.signal_search_entry = tk.Entry(self.search_frame)
-        self.signal_search_entry.pack(side=tk.LEFT, fill=tk.X, padx=5, expand=True)
-        self.signal_search_entry.bind('<KeyRelease>', self.update_signal_list)
+    def update_signal_list(self, event=None):  
+        search_term = self.signal_search_entry.get().lower()  
+        self.signal_listbox.delete(0, tk.END)  
 
-        # Frame for Signal List
-        self.signal_frame = tk.Frame(self)
-        self.signal_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.signal_listbox = tk.Listbox(self.signal_frame)
-        self.signal_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.signal_listbox.bind('<Double-1>', self.show_signal_details)
-
-        self.update_signal_list()
-
-    def update_signal_list(self, event=None):
-        search_term = self.signal_search_entry.get().lower()
-        self.signal_listbox.delete(0, tk.END)
-        for message in self.db.messages:
-            for signal in message.signals:
-                if search_term in signal.name.lower():
-                    self.signal_listbox.insert(tk.END, f"{message.name}: {signal.name}")
+        if hasattr(self, 'db'):  
+            for message in self.db.messages:  
+                for signal in message.signals:  
+                    if search_term in signal.name.lower():  
+                        self.signal_listbox.insert(tk.END, f"{message.name}: {signal.name}")
 
 
     def show_signal_details(self, event=None):

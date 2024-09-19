@@ -151,6 +151,7 @@ class SignalDetailsWindow(tk.Toplevel):
     def generate_hex_data(self):  
         # Initialize an empty bitfield  
         bitfield = ""
+        encounter_first_field = 0
         last_end_bit_value = -1
         cur_value = 0
 
@@ -169,6 +170,12 @@ class SignalDetailsWindow(tk.Toplevel):
                 return
 
             # encounter reserved field
+            # message is start with reserved bits
+            if encounter_first_field == 0 and start_bit != 0:
+                bitfield += self.int_to_binary_string(0, start_bit)
+            encounter_first_field = 1
+
+            # message's mid is reserved bits
             if last_end_bit_value != -1 and (start_bit - last_end_bit_value) > 1:
                 bitfield += self.int_to_binary_string(0, start_bit - last_end_bit_value - 1)
 

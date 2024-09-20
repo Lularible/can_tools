@@ -22,7 +22,7 @@ class CANViewerApp(tk.Tk):
 
         if file_path:  
             self.db = cantools.database.load_file(file_path)  
-            self.after(0, self.update_signal_list)  # 更新信号列表  
+            self.after(0, self.update_signal_list)
 
     def load_dbc_file(self):
         threading.Thread(target=self.load_dbc_file_thread, daemon=True).start()  
@@ -141,17 +141,10 @@ class SignalDetailsWindow(tk.Toplevel):
             last_end_bit = start_bit + length - 1  
             row += 1  
 
-        if last_end_bit < 31:  
-            reserved_start = last_end_bit + 1  
-            reserved_end = 31  
-            reserved_description = f"Reserved Bits: {reserved_start} - {reserved_end}"  
-            tk.Label(self.signal_frame, text=reserved_description, justify='left', font=("Arial", 10), borderwidth=1, relief="solid", anchor='w').grid(row=row, column=0, sticky='w', padx=5, pady=5, columnspan=3)  
-
     def on_mouse_wheel(self, event):  
         self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")  
-        
 
-    def generate_hex_data(self):  
+    def generate_hex_data(self):
         # Initialize an empty bitfield  
         bitfield = ""
         encounter_first_field = 0
@@ -184,7 +177,7 @@ class SignalDetailsWindow(tk.Toplevel):
 
             last_end_bit_value = start_bit + length - 1
 
-            bitfield += self.int_to_binary_string(cur_value, length)
+            bitfield += ''.join(reversed(self.int_to_binary_string(cur_value, length)))
 
         # Pad the bitfield to ensure it meets the minimum size requirements  
         padding_bits_count = self.calculate_padding_bits_size(len(bitfield))
@@ -229,7 +222,7 @@ class SignalDetailsWindow(tk.Toplevel):
         
         hex_array = []
         for i in range(0, len(binary_string), 8):
-            byte = binary_string[i:i+8]
+            byte = ''.join(reversed(binary_string[i:i+8]))
             hex_value = int(byte, 2)
             hex_array.append(f'0x{hex_value:02x}')
 

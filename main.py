@@ -7,11 +7,14 @@ from time import sleep
 import time
 import datetime
 import threading
+import queue
 
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, filedialog
 import sys  
 import io
+import ctypes  
+import os
 
 
 class UDSClient():
@@ -45,9 +48,21 @@ class UDSClient():
 
     #endregion
 
+
     def __init__(self, IsFD, need_keep_alive, log_area = None):
         file_name = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S') + ".log"
         self._file_record = open(file_name, "w+")
+        self.file_queue = queue.Queue() 
+        self.gui_queue = queue.Queue()
+
+        self.file_thread = threading.Thread(target=self.write_to_file)  
+        self.file_thread.daemon = True
+        self.file_thread.start()  
+
+        self.gui_thread = threading.Thread(target=self.update_gui)  
+        self.gui_thread.daemon = True
+        self.gui_thread.start()  
+
         self._IsFD = IsFD
         self._need_keep_alive = need_keep_alive
         """
@@ -95,6 +110,17 @@ class UDSClient():
             self._can_msg_obj.DLC = 15
             self._can_msg_obj.MSGTYPE = PCAN_MESSAGE_FD.value | PCAN_MESSAGE_BRS.value
 
+        # for 27 service
+        self.auto_send_key = False
+        base_dir = os.path.dirname(os.path.abspath(__file__))  
+        dll_path = os.path.join(base_dir, 'SeedKey_x64.dll')         
+        self.dll = ctypes.CDLL(dll_path)  
+        self.dll.ASK_KeyGenerate.restype = ctypes.c_int
+        self.dll.ASK_KeyGenerate.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint8)]
+        self.last_recieve_msg_is_27_seed_first_frame = False
+        self.last_send_msg_is_27_key_first_frame = False
+        self.recieve_27_key = '0'
+
         
         print("Successfully initialized.")
 
@@ -102,6 +128,53 @@ class UDSClient():
         if self.m_DLLFound:
             self.m_objPCANBasic.Uninitialize(PCAN_NONEBUS)
         self._file_record.close()
+        # self.root.destroy()
+
+    # for 27 service
+    def generate_key(self, seed):  
+        if not isinstance(seed, bytes) or len(seed) != 8:  
+            raise ValueError("Seed must be a bytes object of length 8.")
+
+        seed_array = (ctypes.c_uint8 * len(seed))(*seed)  
+        key_array = (ctypes.c_uint8 * 8)()  
+
+        # call ASK_KeyGenerate  
+        result = self.dll.ASK_KeyGenerate(seed_array, key_array)  
+
+        if result != 0:  
+            raise RuntimeError("Key generation failed.")  
+
+        # convert format
+        return [key_array[i] for i in range(len(key_array))] 
+
+    def log(self, message):  
+        self.file_queue.put(message)  
+        self.gui_queue.put(message)  
+
+    def write_to_file(self):  
+        while True:  
+            try:  
+                message = self.file_queue.get(timeout=1) 
+                self._file_record.write(f"{message}")  
+                self._file_record.flush()
+                self.file_queue.task_done()  
+            except queue.Empty:  
+                continue  
+
+    def update_gui(self):  
+        while True:  
+            try:  
+                message = self.gui_queue.get(timeout=1)  
+                log_message = f"{message}"  
+                self._update_log_area(log_message)    
+                self.gui_queue.task_done()  
+            except queue.Empty:  
+                continue  
+
+    def _update_log_area(self, log_message):  
+        self.log_area.insert(tk.END, log_message)  
+        self.log_area.see(tk.END) 
+        self.log_area.update()
 
     def getInput(self, msg="Press <Enter> to continue...", default=""):
         res = default
@@ -124,7 +197,6 @@ class UDSClient():
         self._can_msg_obj.ID = next_message[tx_canid_index]
         if self._IsFD == True:
             self._can_msg_obj.DLC = self.GetDLCFromLength(len(next_message[msg_contend_index]))
-            pass
         else:
             self._can_msg_obj.LEN = len(next_message[msg_contend_index])
 
@@ -138,6 +210,8 @@ class UDSClient():
         stsResult = PCAN_ERROR_OK
         is_pending = False
         is_multi_msg = False
+        is_recieve_flow_ctr_msg = False
+        need_read_more_msg = False
 
         ## We read at least one time the queue looking for messages. If a message is found, we look again trying to 
         ## find more. If the queue is empty or an error occurr, we get out from the dowhile statement.
@@ -146,9 +220,9 @@ class UDSClient():
         # use timeout to control read can msg
         while (int(round(time.time() * 1000)) < timeout_stamp):
             if self._IsFD:
-                stsResult, is_pending, is_multi_msg = self.ReadMessageFD(rx_canid)
+                stsResult, is_pending, is_multi_msg, is_recieve_flow_ctr_msg, need_read_more_msg = self.ReadMessageFD(rx_canid)
             else:
-                stsResult, is_pending, is_multi_msg = self.ReadMessage(rx_canid)
+                stsResult, is_pending, is_multi_msg, is_recieve_flow_ctr_msg, need_read_more_msg = self.ReadMessage(rx_canid)
             if stsResult != PCAN_ERROR_OK and stsResult != PCAN_ERROR_QRCVEMPTY:
                 self.ShowStatus(stsResult)
                 return
@@ -157,6 +231,10 @@ class UDSClient():
                 timeout_stamp += addition_time_for_pending
             elif is_multi_msg == True:
                 timeout_stamp += rx_timeout
+            elif is_recieve_flow_ctr_msg == True:
+                # if recieve a flow control msg, break loop right now for send next frame asap
+                if need_read_more_msg == False:
+                    break
 
 
     def ReadMessage(self, rx_canid):
@@ -170,12 +248,14 @@ class UDSClient():
         stsResult = self.m_objPCANBasic.Read(self.PcanHandle)
         is_pending = False
         is_multi_msg = False
+        is_recieve_flow_ctr_msg = False
+        need_read_more_msg = False
 
         if stsResult[0] == PCAN_ERROR_OK:
             ## We show the received message
-            is_pending, is_multi_msg = self.ProcessMessageCan(stsResult[1], stsResult[2], rx_canid)
+            is_pending, is_multi_msg, is_recieve_flow_ctr_msg, need_read_more_msg = self.ProcessMessageCan(stsResult[1], stsResult[2], rx_canid)
 
-        return (stsResult[0], is_pending, is_multi_msg)
+        return (stsResult[0], is_pending, is_multi_msg, is_recieve_flow_ctr_msg, need_read_more_msg)
 
     def ReadMessageFD(self, rx_canid):
         """
@@ -189,44 +269,66 @@ class UDSClient():
         stsResult = self.m_objPCANBasic.ReadFD(self.PcanHandle)
         is_pending = False
         is_multi_msg = False
+        is_recieve_flow_ctr_msg = False
+        need_read_more_msg = False
 
         if stsResult[0] == PCAN_ERROR_OK:
-            is_pending, is_multi_msg = self.ProcessMessageCanFd(stsResult[1],stsResult[2], rx_canid)
+            is_pending, is_multi_msg, is_recieve_flow_ctr_msg, need_read_more_msg = self.ProcessMessageCanFd(stsResult[1],stsResult[2], rx_canid)
             
-        return (stsResult[0], is_pending, is_multi_msg)
+        return (stsResult[0], is_pending, is_multi_msg, is_recieve_flow_ctr_msg, need_read_more_msg)
 
     def ProcessMessageCan(self, msg, itstimestamp, rx_canid):
-         """
-         Processes a received CAN message
-         
-         Parameters:
-             msg = The received PCAN-Basic CAN message
-             itstimestamp = Timestamp of the message as TPCANTimestamp structure
-         """
-         microsTimeStamp = itstimestamp.micros + (1000 * itstimestamp.millis) + (0x100000000 * 1000 * itstimestamp.millis_overflow)
-         msg_can_id =  self.GetIdString(msg.ID, msg.MSGTYPE)
-         is_pending = False
-         is_multi_msg = False
-         if msg_can_id == rx_canid:
+        """
+        Processes a received CAN message
+        
+        Parameters:
+            msg = The received PCAN-Basic CAN message
+            itstimestamp = Timestamp of the message as TPCANTimestamp structure
+        """
+        microsTimeStamp = itstimestamp.micros + (1000 * itstimestamp.millis) + (0x100000000 * 1000 * itstimestamp.millis_overflow)
+        msg_can_id =  self.GetIdString(msg.ID, msg.MSGTYPE)
+        is_pending = False
+        is_multi_msg = False
+        is_recieve_flow_ctr_msg = False
+        need_read_more_msg = False
+        if msg_can_id == rx_canid:
             msg_length = self.GetLengthFromDLC(msg.DLC)
-            print("\nReceive message:")
-            print(self.GetDataString(msg.DATA,msg.MSGTYPE))
-            self._file_record.write("Receive message:\n")
-            self._file_record.write(self.GetDataString(msg.DATA[:msg_length],msg.MSGTYPE) + "\n")
-            print("----------------------------------------------------------")
-            if self.log_area:
-                log_message = f"Receive message:\n" + self.GetDataString(msg.DATA[:msg_length],msg.MSGTYPE) + "\n"
-                self.log_area.insert(tk.END, log_message)  # Insert log message into the text area  
-                self.log_area.see(tk.END)  # Scroll to the end of the text area  
-                self.log_area.update()
+            self.log("Receive message:\n" + self.GetDataString(msg.DATA[:msg_length],msg.MSGTYPE) + "\n")
             if rx_canid in rx_uds_msg_id:
-                if self.is_nrc_pending(self.GetDataString(msg.DATA,msg.MSGTYPE)):
+                msg_string = self.GetDataString(msg.DATA,msg.MSGTYPE)
+                if self.auto_send_key == True:
+                    # got the 27 service seed, generate the key and send
+                    if msg_string.split(' ')[0] == '21' and self.last_recieve_msg_is_27_seed_first_frame == True:
+                        self.recieve_27_key = self.recieve_27_key + msg_string.split(' ')[1:5]
+                        seed = bytes(int(h, 16) for h in self.recieve_27_key)
+                        key = self.generate_key(seed)
+                        key_27_12_first_frame[4:] = key[:4]
+                        key_27_12_second_frame[1:5] = key[4:]
+                        self.WriteMessages(key_27_12_first_frame)
+                        self.last_send_msg_is_27_key_first_frame = True                    
+                    else:
+                        # reset the flag
+                        self.last_recieve_msg_is_27_seed_first_frame = False
+                if self.is_nrc_pending(msg_string):
                     is_pending = True
-                if self.is_multi_msg(self.GetDataString(msg.DATA,msg.MSGTYPE)):
+                elif self.is_multi_msg(msg_string):
+                    # send flow control asap
                     self.WriteMessages(msg_flow_control)
                     is_multi_msg = True
+                elif self.recieve_flow_ctr_msg(msg_string):
+                    is_recieve_flow_ctr_msg = True  
+                    if self.auto_send_key == True:
+                        if self.last_send_msg_is_27_key_first_frame == True:
+                            self.WriteMessages(key_27_12_second_frame)
+                            need_read_more_msg = True
+                            self.last_send_msg_is_27_key_first_frame = False  
+ 
+                if self.auto_send_key == True:
+                    if self.recieve_27_key_msg(msg_string):
+                        self.last_recieve_msg_is_27_seed_first_frame = True
+                        self.recieve_27_key = msg_string.split(' ')[4:8]
 
-         return (is_pending, is_multi_msg)
+        return (is_pending, is_multi_msg, is_recieve_flow_ctr_msg, need_read_more_msg)
 
     def ProcessMessageCanFd(self, msg, itstimestamp, rx_canid):
         """
@@ -239,27 +341,45 @@ class UDSClient():
         msg_can_id =  self.GetIdString(msg.ID, msg.MSGTYPE)
         is_pending = False
         is_multi_msg = False
+        is_recieve_flow_ctr_msg = False
+        need_read_more_msg = False
         if msg.ID == rx_canid:
             msg_length = self.GetLengthFromDLC(msg.DLC)
-            print("\nReceive message:")
-            print(self.GetDataString(msg.DATA[:msg_length],msg.MSGTYPE))
-            self._file_record.write("Receive message:\n")
-            self._file_record.write(self.GetDataString(msg.DATA[:msg_length],msg.MSGTYPE) + "\n")
-            if self.log_area:
-                log_message = f"Receive message:\n" + self.GetDataString(msg.DATA[:msg_length],msg.MSGTYPE) + "\n"
-                self.log_area.insert(tk.END, log_message)  # Insert log message into the text area  
-                self.log_area.see(tk.END)  # Scroll to the end of the text area  
-                self.log_area.update()
-            print("----------------------------------------------------------")
+            self.log("Receive message:\n" + self.GetDataString(msg.DATA[:msg_length],msg.MSGTYPE) + "\n")
             if rx_canid in rx_uds_msg_id:
-                if self.is_nrc_pending(self.GetDataString(msg.DATA,msg.MSGTYPE)):
+                msg_string = self.GetDataString(msg.DATA,msg.MSGTYPE)
+                if self.auto_send_key == True:
+                    # got the 27 service seed, generate the key and send
+                    if msg_string.split(' ')[0] == '21' and self.last_recieve_msg_is_27_seed_first_frame == True:
+                        self.recieve_27_key = self.recieve_27_key + msg_string.split(' ')[1:5]
+                        seed = bytes(int(h, 16) for h in self.recieve_27_key)
+                        key = self.generate_key(seed)
+                        key_27_12_first_frame[4:] = key[:4]
+                        key_27_12_second_frame[1:5] = key[4:]
+                        self.WriteMessages(key_27_12_first_frame)
+                        self.last_send_msg_is_27_key_first_frame = True                    
+                    else:
+                        # reset the flag
+                        self.last_recieve_msg_is_27_seed_first_frame = False
+
+                if self.is_nrc_pending(msg_string):
                     is_pending = True
-                if self.is_multi_msg(self.GetDataString(msg.DATA,msg.MSGTYPE)):
+                elif self.is_multi_msg(msg_string):
                     # send flow control asap
                     self.WriteMessages(msg_flow_control)
                     is_multi_msg = True
+                elif self.recieve_flow_ctr_msg(msg_string):
+                    is_recieve_flow_ctr_msg = True  
+                    if self.last_send_msg_is_27_key_first_frame == True:
+                        self.WriteMessages(key_27_12_second_frame)
+                        need_read_more_msg = True
+                        self.last_send_msg_is_27_key_first_frame = False   
+                if self.auto_send_key == True:
+                    if self.recieve_27_key_msg(msg_string):
+                        self.last_recieve_msg_is_27_seed_first_frame = True
+                        self.recieve_27_key = msg_string.split(' ')[4:8]
 
-        return (is_pending, is_multi_msg)
+        return (is_pending, is_multi_msg, is_recieve_flow_ctr_msg, need_read_more_msg)
 
     def is_nrc_pending(self, input_string):
         hex_values = input_string.split(' ')
@@ -276,19 +396,23 @@ class UDSClient():
             return True
         return False
 
+    def recieve_flow_ctr_msg(self, input_string):
+        hex_values = input_string.split(' ')
+        if hex_values[0] == '30':
+            return True
+        return False
+    
+    def recieve_27_key_msg(self, input_string):
+        hex_values = input_string.split(' ')
+        if hex_values[0] == '10' and hex_values[1] == '0A' and hex_values[2] == '67':
+            return True
+        return False
+
     def WriteMessages(self, message):
         '''
         Function for writing PCAN-Basic messages
         '''
-        self._file_record.write("\nSend message:\n")
-        self._file_record.write(self.GetDataString(message, 0) + "\n")
-        # self._file_record.write(str([hex(num) for num in message]) + "\n")
-        print("\n\nSend message:")
-        print(self.GetDataString(message, 0) + "\n")
-        if self.log_area:
-            log_message = f"\n\nSend message:\n" + self.GetDataString(message, 0) + "\n"
-            self.log_area.insert(tk.END, log_message)  # Insert log message into the text area  
-            self.log_area.see(tk.END)  # Scroll to the end of the text area  
+        self.log("\n\nSend message:\n" + self.GetDataString(message, 0) + "\n")
 
         if self._IsFD:
             stsResult = self.WriteMessageFD(message)
@@ -663,6 +787,11 @@ class App:
         self.keep_alive_checkbox = tk.Checkbutton(master, text="Circlely Send Keep Alive", variable=self.keep_alive_var, command=self.toggle_keep_alive)  
         self.keep_alive_checkbox.pack(pady=5)  
 
+        # Auto send 27 service key  
+        self.auto_send_27_servive_key = tk.BooleanVar(value=False)  # Default value is False  
+        self.auto_send_27_servive_key_checkbox = tk.Checkbutton(master, text="Auto send 27 service key", variable=self.auto_send_27_servive_key, command=self.set_the_auto_send_27_service_flag)  
+        self.auto_send_27_servive_key_checkbox.pack(pady=5)  
+
         # Submit button  
         self.submit_button = tk.Button(master, text="Send msg", command=self.submit, height=2, width=20)  
         self.submit_button.pack(pady=5)  
@@ -699,6 +828,8 @@ class App:
         self.uds_client = UDSClient(self.is_can_fd, self.need_keep_alive, self.log_area)  
 
         self.keep_alive_thread = None  # Thread for keep_alive messages  
+        self.toggle_keep_alive_thread_start = False
+        self.circley_set_the_auto_send_27_service_flag_thread_start = False
 
     def create_checkboxes(self):  
         # Frame for internal DID checkboxes with a label frame  
@@ -760,15 +891,28 @@ class App:
     def toggle_keep_alive(self):  
         if self.keep_alive_var.get():  
             self.need_keep_alive = True  
-            self.keep_alive_thread = threading.Thread(target=self.keep_alive_messages)  
-            self.keep_alive_thread.start()  
+            if self.toggle_keep_alive_thread_start == False:
+                self.keep_alive_thread = threading.Thread(target=self.keep_alive_messages)  
+                self.keep_alive_thread.start()  
+                self.toggle_keep_alive_thread_start = True
         else:  
             self.need_keep_alive = False
 
     def keep_alive_messages(self):
         while self.need_keep_alive:  
             self.uds_client.send_and_receive_messages([msg_keep_alive])  # Send keep_alive message  
-            time.sleep(3)  # Wait for 1 second  
+            time.sleep(3)  # Wait for 3 seconds  
+
+    def set_the_auto_send_27_service_flag(self):
+        if self.circley_set_the_auto_send_27_service_flag_thread_start == False:
+            self.set_the_auto_send_27_service_flag_thread = threading.Thread(target=self.circley_set_the_auto_send_27_service_flag)  
+            self.set_the_auto_send_27_service_flag_thread.start()  
+            self.circley_set_the_auto_send_27_service_flag_thread_start = True        
+
+    def circley_set_the_auto_send_27_service_flag(self):
+        while True:
+            self.uds_client.auto_send_key = self.auto_send_27_servive_key.get()
+            time.sleep(1)
 
     def submit(self):  
         threading.Thread(target=self.send_messages).start()

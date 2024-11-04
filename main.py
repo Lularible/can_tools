@@ -889,18 +889,15 @@ class App:
             self.checkboxes_session_switch.append(config)
 
     def toggle_keep_alive(self):  
-        if self.keep_alive_var.get():  
-            self.need_keep_alive = True  
-            if self.toggle_keep_alive_thread_start == False:
-                self.keep_alive_thread = threading.Thread(target=self.keep_alive_messages)  
-                self.keep_alive_thread.start()  
-                self.toggle_keep_alive_thread_start = True
-        else:  
-            self.need_keep_alive = False
+        if self.toggle_keep_alive_thread_start == False:
+            self.keep_alive_thread = threading.Thread(target=self.keep_alive_messages)  
+            self.keep_alive_thread.start()  
+            self.toggle_keep_alive_thread_start = True
 
     def keep_alive_messages(self):
-        while self.need_keep_alive:  
-            self.uds_client.send_and_receive_messages([msg_keep_alive])  # Send keep_alive message  
+        while True:
+            if self.keep_alive_var.get():  
+                self.uds_client.send_and_receive_messages([msg_keep_alive])  # Send keep_alive message  
             time.sleep(3)  # Wait for 3 seconds  
 
     def set_the_auto_send_27_service_flag(self):
